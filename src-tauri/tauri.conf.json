@@ -56,7 +56,7 @@
       "icons/icon.ico"
     ],
     "macOS": {},
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": false
   },
   "plugins": {
     "updater": {

@@ -1942,6 +1942,62 @@ pub async fn get_live_game(creds: &LcuCredentials, my_summoner_id: Option<i64>, 
 // Live Client Data API (https://127.0.0.1:2999) — real-time in-game data
 // ============================================================
 
+/// Full item costs (`gold.total`) from Data Dragon, keyed by item id.
+/// Fetched once per app run; a failed fetch is retried at most once a minute
+/// so an offline poll loop is not slowed down every second.
+static ITEM_TOTAL_COSTS: std::sync::OnceLock<std::collections::HashMap<i64, f64>> = std::sync::OnceLock::new();
+static ITEM_COSTS_LAST_TRY: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+async fn item_total_costs() -> Option<&'static std::collections::HashMap<i64, f64>> {
+    if let Some(c) = ITEM_TOTAL_COSTS.get() {
+        return Some(c);
+    }
+    {
+        let mut last = ITEM_COSTS_LAST_TRY.lock().ok()?;
+        if let Some(t) = *last {
+            if t.elapsed() < std::time::Duration::from_secs(60) {
+                return None;
+            }
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    match fetch_item_total_costs().await {
+        Ok(map) => {
+            info!("Loaded {} item costs from Data Dragon", map.len());
+            let _ = ITEM_TOTAL_COSTS.set(map);
+            ITEM_TOTAL_COSTS.get()
+        }
+        Err(e) => {
+            log::warn!("Data Dragon item costs unavailable: {}", e);
+            None
+        }
+    }
+}
+
+async fn fetch_item_total_costs() -> Result<std::collections::HashMap<i64, f64>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let versions: Vec<String> = client
+        .get("https://ddragon.leagueoflegends.com/api/versions.json")
+        .send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+    let version = versions.first().ok_or("no Data Dragon versions")?;
+    let data: serde_json::Value = client
+        .get(format!("https://ddragon.leagueoflegends.com/cdn/{}/data/en_US/item.json", version))
+        .send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+    let items = data.get("data").and_then(|d| d.as_object()).ok_or("item.json has no data")?;
+    Ok(items.iter()
+        .filter_map(|(id, item)| {
+            let id = id.parse::<i64>().ok()?;
+            let total = item.get("gold")?.get("total")?.as_f64()?;
+            Some((id, total))
+        })
+        .collect())
+}
+
 fn live_client_url(path: &str) -> String {
     format!("https://127.0.0.1:2999{}", path)
 }
@@ -2034,10 +2090,21 @@ pub async fn poll_live_game_data(live_state: &mut LiveGameState, my_name: &str) 
                     .filter_map(|item| item.get("itemID").and_then(|v| v.as_i64()))
                     .collect())
                 .unwrap_or_default();
-            // Sum item prices directly from API (more reliable than Data Dragon lookup)
+            // The Live Client `price` field is the item's combine cost (the last
+            // recipe step), not its full cost, and ignores stack count. Use the
+            // Data Dragon total cost × count instead, falling back to `price`
+            // only for items Data Dragon does not list.
+            let costs = item_total_costs().await;
             let items_gold: f64 = items_arr
                 .map(|arr| arr.iter()
-                    .filter_map(|item| item.get("price").and_then(|v| v.as_f64()))
+                    .map(|item| {
+                        let id = item.get("itemID").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let count = item.get("count").and_then(|v| v.as_f64()).unwrap_or(1.0).max(1.0);
+                        let unit = costs.and_then(|c| c.get(&id).copied())
+                            .or_else(|| item.get("price").and_then(|v| v.as_f64()))
+                            .unwrap_or(0.0);
+                        unit * count
+                    })
                     .sum())
                 .unwrap_or(0.0);
             // Item value only: gold in hand is known for the local player alone,
